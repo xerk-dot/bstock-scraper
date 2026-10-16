@@ -25,6 +25,9 @@ examples:
 
   # same, but weight freight distance above everything else
   bstock -m us --rank --home "Chicago, IL" --weight proximity=0.6 --weight value=0.2
+
+  # hard radius: only lots within 600 km of home
+  bstock -m us --rank --home "Chicago, IL" --within 600
 """
 
 
@@ -140,9 +143,20 @@ def build_parser():
         ),
     )
     group.add_argument(
-        "--max-distance", type=float, default=ranking.DEFAULT_CAPS["max_distance_km"],
-        metavar="KM",
-        help="distance at which the proximity score reaches zero (default: %(default)s)",
+        "--within", type=float, default=None, metavar="KM",
+        help=(
+            "hard radius: drop lots further than this from --home, and lots "
+            "whose location cannot be resolved. Unlike the scoring weights, "
+            "this removes rows rather than just ranking them lower."
+        ),
+    )
+    group.add_argument(
+        "--distance-half", type=float,
+        default=ranking.DEFAULT_CAPS["distance_half_km"], metavar="KM",
+        help=(
+            "distance at which the proximity score falls to 0.5; the curve "
+            "decays smoothly from there (default: %(default)s)"
+        ),
     )
     group.add_argument(
         "--msrp-cap", type=float, default=ranking.DEFAULT_CAPS["msrp_pct"],
@@ -251,10 +265,14 @@ def main(argv=None):
 
     if args.top is not None and not args.rank:
         parser.error("--top only applies with --rank")
+    if args.within is not None and not args.rank:
+        parser.error("--within only applies with --rank")
+    if args.within is not None and not args.home:
+        parser.error("--within needs --home to measure a radius from")
 
     weights = ranking.parse_weights(args.weight, parser.error)
     caps = {
-        "max_distance_km": args.max_distance,
+        "distance_half_km": args.distance_half,
         "msrp_pct": args.msrp_cap,
         "size_units": args.size_cap,
         "bids": args.bids_cap,
@@ -327,11 +345,19 @@ def main(argv=None):
         return 1
 
     if args.rank:
+        collected = len(rows)
         rows = ranking.rank_rows(
             rows, home=home, prefer_size=args.prefer_size,
-            weights=weights, caps=caps,
+            weights=weights, caps=caps, within_km=args.within,
         )
-        if home is not None:
+        if args.within is not None:
+            dropped = collected - len(rows)
+            if dropped:
+                progress.warn(
+                    "--within {:g} km dropped {} of {} lot(s) as too far away "
+                    "or unplaceable".format(args.within, dropped, collected)
+                )
+        elif home is not None:
             unplaced = sum(1 for row in rows if row.get("distance_km") is None)
             if unplaced:
                 progress.warn(

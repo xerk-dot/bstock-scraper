@@ -29,8 +29,9 @@ DEFAULT_WEIGHTS = {
 }
 
 DEFAULT_CAPS = {
-    # Distance at which the proximity score bottoms out.
-    "max_distance_km": 2500.0,
+    # Distance at which the proximity score falls to 0.5. The curve decays
+    # smoothly from there rather than bottoming out -- see _proximity_score.
+    "distance_half_km": 800.0,
     # bid-to-MSRP percentage at which the value score bottoms out.
     "msrp_pct": 40.0,
     # Pallet-equivalents at which the size score bottoms out.
@@ -73,6 +74,23 @@ def _ramp(value, cap):
         return None
     fraction = min(max(float(value) / float(cap), 0.0), 1.0)
     return round(1.0 - fraction, 4)
+
+
+def _proximity_score(distance_km, half_km):
+    """Score distance on a smooth decay that never stops discriminating.
+
+    ``1 / (1 + d/half)``: zero km scores 1.0, ``half_km`` scores 0.5, and the
+    curve keeps falling thereafter without ever reaching zero.
+
+    A clamped linear ramp was tried first and was wrong. Past its cap every
+    lot scored exactly 0.0, so distance stopped carrying any information: a
+    lot 2,857 km away tied with one 786 km away and then beat it on lot size,
+    ranking Oregon above Tennessee for a buyer in Chicago. A curve with no
+    floor cannot produce that inversion.
+    """
+    if distance_km is None or not half_km or half_km <= 0:
+        return None
+    return round(1.0 / (1.0 + max(float(distance_km), 0.0) / float(half_km)), 4)
 
 
 def _size_score(units, cap, prefer):
@@ -119,7 +137,7 @@ def score_row(row, home=None, prefer_size="small", weights=None, caps=None):
     size_score = _size_score(units, caps["size_units"], prefer_size)
 
     parts = {
-        "proximity": _ramp(distance, caps["max_distance_km"]),
+        "proximity": _proximity_score(distance, caps["distance_half_km"]),
         "value": _ramp(row.get("bid_to_msrp_pct"), caps["msrp_pct"]),
         "size": size_score,
         "competition": _ramp(row.get("bids"), caps["bids"]),
@@ -149,14 +167,27 @@ def score_row(row, home=None, prefer_size="small", weights=None, caps=None):
     }
 
 
-def rank_rows(rows, home=None, prefer_size="small", weights=None, caps=None):
+def rank_rows(rows, home=None, prefer_size="small", weights=None, caps=None,
+              within_km=None):
     """Score and sort lots best-first, numbering them from 1.
 
-    Unscoreable lots sort last. Returns a new list; input rows are updated in
-    place with their rank fields.
+    ``within_km`` is a hard radius: lots further than that from ``home`` are
+    dropped entirely, as are lots whose location could not be resolved, since
+    a radius cannot be honoured for a lot that cannot be placed. Scoring
+    weights only tilt a ranking; this removes rows.
+
+    Unscoreable lots sort last. Input rows are updated in place with their
+    rank fields; the returned list may be a subset.
     """
     for row in rows:
         row.update(score_row(row, home, prefer_size, weights, caps))
+
+    if within_km is not None:
+        rows = [
+            row for row in rows
+            if row.get("distance_km") is not None
+            and row["distance_km"] <= float(within_km)
+        ]
 
     ordered = sorted(
         rows,

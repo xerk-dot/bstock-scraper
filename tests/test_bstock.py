@@ -494,13 +494,19 @@ class ScoringTests(unittest.TestCase):
                     self.row(**{field: value}), home=self.CHICAGO)["score"]
                 self.assertLess(worse, best)
 
-    def test_caps_clamp_rather_than_going_negative(self):
+    def test_a_terrible_lot_stays_within_bounds(self):
         scored = ranking.score_row(
             self.row(bid_to_msrp_pct=500.0, bids=900, lot_size="Full Truckload",
                      location="Salem, OR"),
             home=self.CHICAGO,
         )
-        self.assertEqual(scored["score"], 0.0)
+        # Value, size and competition clamp to zero; proximity decays but never
+        # reaches it, so the composite is small yet strictly positive.
+        self.assertEqual(scored["score_value"], 0.0)
+        self.assertEqual(scored["score_size"], 0.0)
+        self.assertEqual(scored["score_competition"], 0.0)
+        self.assertGreater(scored["score"], 0.0)
+        self.assertLess(scored["score"], 10.0)
 
     def test_missing_axes_are_dropped_not_zeroed(self):
         # An unmanifested lot has no MSRP; that must not read as "worst value".
@@ -569,10 +575,33 @@ class RankOrderTests(unittest.TestCase):
         ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
         self.assertEqual(ranked[0]["auction_id"], 2)
 
-    def test_distance_outweighs_size_at_default_weights(self):
+    def test_nearer_wins_among_equally_sized_lots(self):
         ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
         order = [row["auction_id"] for row in ranked]
-        self.assertLess(order.index(3), order.index(1))
+        # 1 and 2 are both single pallets; 2 is far closer.
+        self.assertLess(order.index(2), order.index(1))
+
+    def test_smaller_wins_among_equidistant_lots(self):
+        ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
+        order = [row["auction_id"] for row in ranked]
+        # 2 and 3 both ship from Caledonia; 2 is a single pallet.
+        self.assertLess(order.index(2), order.index(3))
+
+    def test_no_inversion_once_lots_exceed_a_long_haul(self):
+        # Regression. With a linear ramp that bottomed out at 2500 km, both of
+        # these scored proximity 0.0, distance stopped discriminating, and the
+        # smaller-but-far Oregon lot beat the larger-but-near Tennessee one for
+        # a Chicago buyer. The decay curve must keep Tennessee ahead.
+        rows = [
+            {"auction_id": "salem", "lot_size": "1 Pallet",
+             "bid_to_msrp_pct": 1.03, "bids": 0,
+             "location": "Salem, OR, US", "country": "US"},
+            {"auction_id": "chattanooga", "lot_size": "2 Pallets",
+             "bid_to_msrp_pct": 0.23, "bids": 0,
+             "location": "Chattanooga, TN, US", "country": "US"},
+        ]
+        ranked = ranking.rank_rows(rows, home=self.CHICAGO)
+        self.assertEqual(ranked[0]["auction_id"], "chattanooga")
 
     def test_ranks_are_contiguous_and_sorted(self):
         ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
@@ -595,6 +624,81 @@ class RankOrderTests(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(ranking.rank_rows([], home=self.CHICAGO), [])
+
+
+class ProximityCurveTests(unittest.TestCase):
+    def test_zero_distance_is_a_perfect_score(self):
+        self.assertEqual(ranking._proximity_score(0, 800), 1.0)
+
+    def test_half_distance_scores_one_half(self):
+        self.assertEqual(ranking._proximity_score(800, 800), 0.5)
+
+    def test_strictly_decreasing_and_never_zero(self):
+        distances = [0, 100, 400, 800, 1600, 2858, 7436, 20000]
+        scores = [ranking._proximity_score(d, 800) for d in distances]
+        for nearer, further in zip(scores, scores[1:]):
+            self.assertGreater(nearer, further)
+        self.assertGreater(scores[-1], 0.0)
+
+    def test_scale_is_configurable(self):
+        tight = ranking._proximity_score(800, 200)
+        loose = ranking._proximity_score(800, 3000)
+        self.assertLess(tight, loose)
+
+    def test_missing_or_invalid_inputs(self):
+        self.assertIsNone(ranking._proximity_score(None, 800))
+        self.assertIsNone(ranking._proximity_score(100, 0))
+
+    def test_caps_override_reaches_the_score(self):
+        row = {"lot_size": "1 Pallet", "bid_to_msrp_pct": 0.0, "bids": 0,
+               "location": "Chattanooga, TN, US", "country": "US"}
+        tight = ranking.score_row(row, (41.88, -87.63),
+                                  caps={"distance_half_km": 100.0})
+        loose = ranking.score_row(row, (41.88, -87.63),
+                                  caps={"distance_half_km": 5000.0})
+        self.assertLess(tight["score_proximity"], loose["score_proximity"])
+
+
+class WithinRadiusTests(unittest.TestCase):
+    CHICAGO = (41.88, -87.63)
+
+    def rows(self):
+        return [
+            {"auction_id": "near", "lot_size": "1 Pallet", "bid_to_msrp_pct": 1.0,
+             "bids": 0, "location": "Caledonia, MI, US", "country": "US"},
+            {"auction_id": "far", "lot_size": "1 Pallet", "bid_to_msrp_pct": 1.0,
+             "bids": 0, "location": "Salem, OR, US", "country": "US"},
+            {"auction_id": "unplaceable", "lot_size": "1 Pallet",
+             "bid_to_msrp_pct": 1.0, "bids": 0, "location": None, "country": None},
+        ]
+
+    def test_drops_lots_beyond_the_radius(self):
+        ranked = ranking.rank_rows(self.rows(), home=self.CHICAGO, within_km=600)
+        self.assertEqual([row["auction_id"] for row in ranked], ["near"])
+
+    def test_drops_lots_that_cannot_be_placed(self):
+        # A radius cannot be honoured for a lot with no known location.
+        ranked = ranking.rank_rows(self.rows(), home=self.CHICAGO, within_km=20000)
+        self.assertNotIn("unplaceable", [row["auction_id"] for row in ranked])
+
+    def test_ranks_are_renumbered_after_filtering(self):
+        ranked = ranking.rank_rows(self.rows(), home=self.CHICAGO, within_km=5000)
+        self.assertEqual([row["rank"] for row in ranked], [1, 2])
+
+    def test_no_radius_keeps_everything(self):
+        ranked = ranking.rank_rows(self.rows(), home=self.CHICAGO)
+        self.assertEqual(len(ranked), 3)
+
+    def test_radius_can_exclude_everything(self):
+        self.assertEqual(
+            ranking.rank_rows(self.rows(), home=self.CHICAGO, within_km=1), [])
+
+    def test_boundary_is_inclusive(self):
+        rows = self.rows()
+        ranking.rank_rows(list(rows), home=self.CHICAGO)
+        exact = next(r for r in rows if r["auction_id"] == "near")["distance_km"]
+        kept = ranking.rank_rows(self.rows(), home=self.CHICAGO, within_km=exact)
+        self.assertIn("near", [row["auction_id"] for row in kept])
 
 
 class WeightParsingTests(unittest.TestCase):

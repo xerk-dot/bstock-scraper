@@ -165,12 +165,17 @@ two-pallet lots three hours up the road.
 Each is scored 0–1 against an absolute, documented threshold — not against the
 rest of the batch — so a score means the same thing from one run to the next.
 
-| Axis | Measures | Scores 1.0 at | Scores 0.0 at | Default weight |
+| Axis | Measures | Scores 1.0 at | Falls off | Default weight |
 | --- | --- | --- | --- | --- |
-| `proximity` | km from `--home` | same city | `--max-distance` (2500 km) | 0.30 |
-| `value` | `bid_to_msrp_pct` | 0% of retail | `--msrp-cap` (40%) | 0.30 |
-| `size` | pallet-equivalents | 1 pallet | `--size-cap` (8 pallets) | 0.25 |
-| `competition` | bid count | no bids yet | `--bids-cap` (15 bids) | 0.15 |
+| `proximity` | km from `--home` | same city | smooth decay, 0.5 at `--distance-half` (800 km) | 0.30 |
+| `value` | `bid_to_msrp_pct` | 0% of retail | 0.0 at `--msrp-cap` (40%) | 0.30 |
+| `size` | pallet-equivalents | 1 pallet | 0.0 at `--size-cap` (8 pallets) | 0.25 |
+| `competition` | bid count | no bids yet | 0.0 at `--bids-cap` (15 bids) | 0.15 |
+
+Proximity is the one axis with no floor. It decays as `1 / (1 + km/half)` —
+half score at `--distance-half`, falling forever after but never reaching
+zero — because a hard cap makes every distant lot score identically and
+distance stops carrying information. See the note below.
 
 Lot size is normalised to pallet-equivalents so mixed listings compare:
 `1 Pallet` → 1, `LTL` → 4, `Small Truckload` → 12, `Truckload` → 24,
@@ -186,9 +191,47 @@ bstock -m us --rank --home "Chicago, IL" --weight proximity=0.6 --weight value=0
 # ignore size, hunt purely on price
 bstock -m us --rank --home "Chicago, IL" --prefer-size any --weight value=0.8
 
-# only consider lots within a day's drive
-bstock -m us --rank --home "Chicago, IL" --max-distance 600 --top 10
+# make distance bite harder (half score at 300 km instead of 800)
+bstock -m us --rank --home "Chicago, IL" --distance-half 300
 ```
+
+### Filtering by radius
+
+Weights only tilt a ranking; they never remove a lot. To actually exclude
+distant lots, use the hard radius:
+
+```bash
+# only lots within 600 km of Chicago
+bstock -m us --rank --home "Chicago, IL" --within 600 --top 10
+```
+
+`--within` drops lots beyond the radius *and* lots whose location could not be
+resolved, since a radius cannot be honoured for a lot that cannot be placed. It
+reports what it dropped:
+
+```
+! --within 600 km dropped 2 of 4 lot(s) as too far away or unplaceable
+```
+
+### Why proximity has no floor
+
+The first version of this scored distance on a clamped linear ramp that hit
+zero at a maximum distance. That was wrong, and it showed up immediately for a
+Chicago buyer:
+
+```
+3  69.23  2857.5  1 Pallet   Salem, OR, US        ← ranked above...
+4  66.25   785.8  2 Pallets  Chattanooga, TN, US  ← ...a lot 2,000 km closer
+```
+
+Past the cap both lots scored proximity `0.0`, so distance stopped
+discriminating entirely and the size axis decided it. The decay curve cannot
+produce that inversion: Tennessee now scores 81.39 against Oregon's 75.79.
+
+The axes still trade off against each other rather than one always winning. A
+full truckload 200 km away *does* lose to a single pallet in Oregon at default
+weights — if you only have a forklift and a garage, that is the right answer.
+Push `--weight proximity` up if it is not yours.
 
 ### Reading a score
 
