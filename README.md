@@ -8,6 +8,10 @@ One row per lot: current bid, MSRP, bid-to-MSRP ratio, units, cost per unit, bid
 count, condition, category, country, close time, buyer's-premium fees — and the
 **Amazon ASINs** and product image URLs behind each lot.
 
+It can also **rank** lots for a specific buyer: how far the freight has to
+travel to you, how cheap the lot is against retail, how big a pallet you want,
+and how contested the bidding is.
+
 ```console
 $ bstock --marketplace eu --filter country=PL --max-items 4 --sort end_time --dir asc --format table
 auction_id  currency  current_bid  msrp      bid_to_msrp_pct  units  cost_per_unit  bids  country  title
@@ -47,6 +51,9 @@ bstock -m us,eu -n 100 -f jsonl -o lots.jsonl
 
 # Only the columns you care about
 bstock -m eu --fields auction_id,current_bid,msrp,bid_to_msrp_pct,asins -o cheap.csv
+
+# Rank for a buyer in Chicago who wants small pallets
+bstock -m us --rank --home "Chicago, IL" --format table
 ```
 
 `--list-filters` is the one to run first. B-Stock assigns its filter ids
@@ -120,9 +127,103 @@ columns with `; `.
 | `description` | detail | Full lot description |
 | `scraped_at` | — | UTC timestamp of the run |
 
+With `--rank`, ten more columns are appended:
+
+| Column | Notes |
+| --- | --- |
+| `rank` | 1 = best; unscoreable lots sort last |
+| `score` | 0–100 composite |
+| `distance_km` | Great-circle km from `--home` |
+| `geo_precision` | `exact`, `metro`, `state` or `country` |
+| `size_units` | Lot size in pallet-equivalents |
+| `score_proximity`, `score_value`, `score_size`, `score_competition` | Per-axis 0–1, blank if the axis was dropped |
+| `score_basis` | Which axes the score actually used |
+
 Detail-page columns need `--no-details` *off* (the default); asset columns need
 `--no-images` off. Both flags make runs dramatically faster when you only want
 listing economics.
+
+## Ranking
+
+`--rank` scores every lot and sorts best-first. Tell it where the freight is
+going with `--home` and it will weigh distance alongside price:
+
+```console
+$ bstock -m us --rank --home "Chicago, IL" --format table
+rank  score  distance_km  lot_size   current_bid  bid_to_msrp_pct  units  cost_per_unit  bids  location
+1     97.43  200.8        1 Pallet   100.0        0.22             2984   0.03           0     Caledonia, MI, US
+2     93.82  200.8        2 Pallets  100.0        0.26             1536   0.07           0     Caledonia, MI, US
+3     86.82  785.8        2 Pallets  100.0        0.23             2205   0.05           0     Chattanooga, TN, US
+4     69.23  2857.5       1 Pallet   100.0        1.03             11     9.09           0     Salem, OR, US
+```
+
+Note rank 4: a single pallet, but 2,857 km away. Freight sinks it below the
+two-pallet lots three hours up the road.
+
+### The four axes
+
+Each is scored 0–1 against an absolute, documented threshold — not against the
+rest of the batch — so a score means the same thing from one run to the next.
+
+| Axis | Measures | Scores 1.0 at | Scores 0.0 at | Default weight |
+| --- | --- | --- | --- | --- |
+| `proximity` | km from `--home` | same city | `--max-distance` (2500 km) | 0.30 |
+| `value` | `bid_to_msrp_pct` | 0% of retail | `--msrp-cap` (40%) | 0.30 |
+| `size` | pallet-equivalents | 1 pallet | `--size-cap` (8 pallets) | 0.25 |
+| `competition` | bid count | no bids yet | `--bids-cap` (15 bids) | 0.15 |
+
+Lot size is normalised to pallet-equivalents so mixed listings compare:
+`1 Pallet` → 1, `LTL` → 4, `Small Truckload` → 12, `Truckload` → 24,
+`Full Truckload` → 26. `--prefer-size large` inverts the axis and
+`--prefer-size any` removes it.
+
+Re-weight freely — weights are renormalised, so they need not sum to 1:
+
+```bash
+# freight dominates; I'll take whatever is close
+bstock -m us --rank --home "Chicago, IL" --weight proximity=0.6 --weight value=0.2
+
+# ignore size, hunt purely on price
+bstock -m us --rank --home "Chicago, IL" --prefer-size any --weight value=0.8
+
+# only consider lots within a day's drive
+bstock -m us --rank --home "Chicago, IL" --max-distance 600 --top 10
+```
+
+### Reading a score
+
+Every component is written back onto the row, so a ranking can always be taken
+apart: `score_proximity`, `score_value`, `score_size`, `score_competition`,
+plus `distance_km`, `size_units` and `score_basis`.
+
+**Missing data is dropped, never zeroed.** Unmanifested lots have no MSRP, and
+Buy Now lots have no bid count. Rather than scoring those axes 0 — which would
+punish a lot for a field B-Stock never published — the axis is removed and the
+remaining weights are renormalised. `score_basis` records which axes were
+actually used, so `proximity+size+value` tells you the value axis was absent.
+
+### How locations are resolved
+
+`--home` accepts a US metro (`"Chicago, IL"`), a state code (`"IL"`), a country
+code (`"GB"`), or literal coordinates (`"41.88,-87.63"`).
+
+Distances are great-circle, from a three-tier lookup, and `geo_precision` on
+every row tells you which tier was used:
+
+- `metro` — the warehouse towns that recur in B-Stock titles (±a few km)
+- `state` — a US state centroid, for an unrecognised city (can be 300 km off)
+- `country` — a country centroid, which is what EU lots resolve to
+
+It is a freight *proxy*, not a routing engine: no roads, no carrier rates, no
+accessorials. Use it to sort candidates, then price the real freight.
+
+### A note for US buyers
+
+The US marketplace is frequently empty between inventory drops, and B-Stock
+then shows recently *closed* lots instead (the scraper warns when this
+happens). The EU marketplace is usually the one with live inventory — but
+ranking it from a US address is mostly academic, since every EU lot sits
+~7,000 km away and scores accordingly.
 
 ## How it works
 
@@ -185,7 +286,7 @@ This tool is deliberately limited, and the limits are the point:
 python3 -m unittest discover -s tests -v
 ```
 
-50 tests, no network: they run against gzipped captures of real listing and
+86 tests, no network: they run against gzipped captures of real listing and
 detail pages stored in `tests/fixtures/` (scrubbed of session artifacts). CI runs
 them on Python 3.8 / 3.10 / 3.12 / 3.13.
 
@@ -195,6 +296,8 @@ bstock/
   scraper.py       pagination, enrichment, run order
   parse.py         listing, facet, and detail-page parsing
   models.py        flat row schema and derived metrics
+  ranking.py       buyer-specific scoring and sorting
+  geo.py           metro/state/country coordinates and distance
   images.py        lot asset (image + ASIN) service client
   http.py          polite stdlib session: rate limit, retries, robots, challenge guard
   marketplaces.py  marketplace definitions, sort fields, filter params

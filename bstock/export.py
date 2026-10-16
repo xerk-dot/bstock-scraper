@@ -30,10 +30,28 @@ def write(rows, fmt="csv", stream=None, fields=FIELDS):
         for row in rows:
             writer.writerow({key: _flatten(row.get(key)) for key in fields})
     elif fmt == "table":
-        _write_table(rows, stream)
+        # A caller that did not narrow the columns gets the readable subset
+        # rather than all 30-odd fields smeared across the terminal.
+        _write_table(rows, stream, None if tuple(fields) == FIELDS else fields)
     else:
         raise ValueError("unknown format {!r}; choose from {}".format(fmt, FORMATS))
 
+
+#: Terminal view for a ranked run: why a lot won comes before what it is.
+RANK_TABLE_FIELDS = (
+    "rank",
+    "score",
+    "distance_km",
+    "lot_size",
+    "currency",
+    "current_bid",
+    "bid_to_msrp_pct",
+    "units",
+    "cost_per_unit",
+    "bids",
+    "location",
+    "title",
+)
 
 #: A readable subset for terminal output; the full schema goes to CSV/JSON.
 TABLE_FIELDS = (
@@ -50,23 +68,27 @@ TABLE_FIELDS = (
 )
 
 
-def _write_table(rows, stream):
+def _write_table(rows, stream, fields=None):
     if not rows:
         stream.write("no lots matched\n")
         return
+    columns = tuple(fields) if fields else TABLE_FIELDS
     widths = {}
-    for field in TABLE_FIELDS:
+    for field in columns:
         widths[field] = max(
             len(field), *(len(str(_flatten(row.get(field)))) for row in rows)
         )
-    widths["title"] = min(widths.get("title", 10), 58)
+    if "title" in widths:
+        widths["title"] = min(widths["title"], 58)
+    if "location" in widths:
+        widths["location"] = min(widths["location"], 24)
 
-    header = "  ".join(field.ljust(widths[field]) for field in TABLE_FIELDS)
+    header = "  ".join(field.ljust(widths[field]) for field in columns)
     stream.write(header.rstrip() + "\n")
     stream.write("-" * min(len(header), 200) + "\n")
     for row in rows:
         cells = []
-        for field in TABLE_FIELDS:
+        for field in columns:
             text = str(_flatten(row.get(field)))
             if len(text) > widths[field]:
                 text = text[: widths[field] - 1] + "…"

@@ -6,7 +6,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from bstock import export, http, images, marketplaces, models, parse
+from bstock import export, geo, http, images, marketplaces, models, parse, ranking
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -379,6 +379,246 @@ class MarketplaceTests(unittest.TestCase):
         with self.assertRaises(KeyError) as caught:
             marketplaces.get("apac")
         self.assertIn("eu", str(caught.exception))
+
+
+class GeoTests(unittest.TestCase):
+    CHICAGO = (41.88, -87.63)
+
+    def test_haversine_against_a_known_distance(self):
+        # Chicago -> Los Angeles is about 2800 km.
+        distance = geo.haversine_km(self.CHICAGO, (34.05, -118.24))
+        self.assertAlmostEqual(distance, 2805, delta=40)
+
+    def test_zero_distance(self):
+        self.assertAlmostEqual(geo.haversine_km(self.CHICAGO, self.CHICAGO), 0.0)
+
+    def test_city_state_resolves_to_metro(self):
+        point, precision = geo.lookup_place("Chicago, IL")
+        self.assertEqual(precision, "metro")
+        self.assertAlmostEqual(point[0], 41.88, places=2)
+
+    def test_country_suffix_does_not_mask_the_state(self):
+        # Regression: detail pages emit "Caledonia, MI, US". Reading only the
+        # last token resolved every US lot to the national centroid, so every
+        # lot came back the same distance from home.
+        point, precision = geo.lookup_place("Caledonia, MI, US")
+        self.assertEqual(precision, "metro")
+        self.assertLess(geo.haversine_km(self.CHICAGO, point), 300)
+
+    def test_unknown_city_falls_back_to_its_state(self):
+        point, precision = geo.lookup_place("Nowheresville, OH, US")
+        self.assertEqual(precision, "state")
+        self.assertEqual(point, geo.STATE_CENTROIDS["OH"])
+
+    def test_eu_location_resolves_to_country(self):
+        point, precision = geo.lookup_place("Cabanillas del Campo, Madrid, ES")
+        self.assertEqual(precision, "country")
+        self.assertEqual(point, geo.COUNTRY_CENTROIDS["ES"])
+
+    def test_bare_codes(self):
+        self.assertEqual(geo.lookup_place("IL")[1], "state")
+        self.assertEqual(geo.lookup_place("PL")[1], "country")
+
+    def test_literal_coordinates(self):
+        point, precision = geo.lookup_place("41.88,-87.63")
+        self.assertEqual(precision, "exact")
+        self.assertEqual(point, (41.88, -87.63))
+
+    def test_out_of_range_coordinates_are_not_treated_as_a_point(self):
+        self.assertEqual(geo.lookup_place("999,999"), (None, None))
+
+    def test_unresolvable(self):
+        self.assertEqual(geo.lookup_place(""), (None, None))
+        self.assertEqual(geo.lookup_place("Atlantis"), (None, None))
+
+    def test_locate_row_prefers_location_then_country(self):
+        self.assertEqual(
+            geo.locate_row({"location": "Chicago, IL", "country": "PL"})[1], "metro")
+        self.assertEqual(
+            geo.locate_row({"location": None, "country": "PL"})[1], "country")
+        self.assertEqual(geo.locate_row({}), (None, None))
+
+
+class SizeUnitTests(unittest.TestCase):
+    def test_pallet_counts(self):
+        self.assertEqual(ranking.size_units("1 Pallet"), 1.0)
+        self.assertEqual(ranking.size_units("4 Pallets"), 4.0)
+
+    def test_truckload_tiers_are_ordered(self):
+        small = ranking.size_units("Small Truckload")
+        full = ranking.size_units("Full Truckload")
+        plain = ranking.size_units("Truckload")
+        self.assertLess(small, plain)
+        self.assertLess(plain, full)
+
+    def test_unmanifested_truckload_is_a_truckload(self):
+        self.assertEqual(ranking.size_units("UNMANIFESTED Truckload"), 24.0)
+
+    def test_ltl_sits_between_pallets_and_truckloads(self):
+        self.assertEqual(ranking.size_units("LTL"), 4.0)
+
+    def test_unknown_and_empty(self):
+        self.assertIsNone(ranking.size_units("Mystery Box"))
+        self.assertIsNone(ranking.size_units(None))
+
+
+class ScoringTests(unittest.TestCase):
+    CHICAGO = (41.88, -87.63)
+
+    def row(self, **overrides):
+        base = {
+            "lot_size": "1 Pallet",
+            "bid_to_msrp_pct": 0.0,
+            "bids": 0,
+            "location": "Chicago, IL",
+            "country": "US",
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_perfect_lot_scores_100(self):
+        scored = ranking.score_row(self.row(), home=self.CHICAGO)
+        self.assertEqual(scored["score"], 100.0)
+        self.assertEqual(scored["geo_precision"], "metro")
+
+    def test_each_axis_moves_the_score_down(self):
+        best = ranking.score_row(self.row(), home=self.CHICAGO)["score"]
+        for field, value in [
+            ("bid_to_msrp_pct", 40.0),
+            ("bids", 15),
+            ("lot_size", "Full Truckload"),
+            ("location", "Salem, OR"),
+        ]:
+            with self.subTest(field=field):
+                worse = ranking.score_row(
+                    self.row(**{field: value}), home=self.CHICAGO)["score"]
+                self.assertLess(worse, best)
+
+    def test_caps_clamp_rather_than_going_negative(self):
+        scored = ranking.score_row(
+            self.row(bid_to_msrp_pct=500.0, bids=900, lot_size="Full Truckload",
+                     location="Salem, OR"),
+            home=self.CHICAGO,
+        )
+        self.assertEqual(scored["score"], 0.0)
+
+    def test_missing_axes_are_dropped_not_zeroed(self):
+        # An unmanifested lot has no MSRP; that must not read as "worst value".
+        scored = ranking.score_row(
+            self.row(bid_to_msrp_pct=None), home=self.CHICAGO)
+        self.assertIsNone(scored["score_value"])
+        self.assertNotIn("value", scored["score_basis"])
+        self.assertEqual(scored["score"], 100.0)
+
+    def test_no_home_drops_the_proximity_axis(self):
+        scored = ranking.score_row(self.row())
+        self.assertIsNone(scored["score_proximity"])
+        self.assertIsNone(scored["distance_km"])
+        self.assertNotIn("proximity", scored["score_basis"])
+
+    def test_prefer_size_directions(self):
+        small_lot, big_lot = self.row(), self.row(lot_size="Full Truckload")
+        small_pref = ranking.score_row(small_lot, home=self.CHICAGO, prefer_size="small")
+        big_pref = ranking.score_row(big_lot, home=self.CHICAGO, prefer_size="large")
+        self.assertEqual(small_pref["score_size"], 1.0)
+        self.assertEqual(big_pref["score_size"], 1.0)
+
+    def test_prefer_size_any_removes_the_axis(self):
+        scored = ranking.score_row(self.row(), home=self.CHICAGO, prefer_size="any")
+        self.assertIsNone(scored["score_size"])
+        self.assertNotIn("size", scored["score_basis"])
+
+    def test_weights_change_the_outcome(self):
+        near_big = self.row(lot_size="Full Truckload")
+        far_small = self.row(location="Salem, OR")
+        size_first = {"proximity": 0.0, "value": 0.0, "size": 1.0, "competition": 0.0}
+        near_first = {"proximity": 1.0, "value": 0.0, "size": 0.0, "competition": 0.0}
+        self.assertGreater(
+            ranking.score_row(far_small, self.CHICAGO, weights=size_first)["score"],
+            ranking.score_row(near_big, self.CHICAGO, weights=size_first)["score"],
+        )
+        self.assertGreater(
+            ranking.score_row(near_big, self.CHICAGO, weights=near_first)["score"],
+            ranking.score_row(far_small, self.CHICAGO, weights=near_first)["score"],
+        )
+
+    def test_score_is_the_renormalised_weighted_mean(self):
+        scored = ranking.score_row(
+            self.row(bid_to_msrp_pct=20.0, bids=None, lot_size=None),
+            home=self.CHICAGO,
+        )
+        # Only proximity (1.0) and value (0.5) survive, weighted 0.30 each.
+        self.assertEqual(scored["score_basis"], "proximity+value")
+        self.assertEqual(scored["score"], 75.0)
+
+
+class RankOrderTests(unittest.TestCase):
+    CHICAGO = (41.88, -87.63)
+
+    def setUp(self):
+        self.rows = [
+            {"auction_id": 1, "lot_size": "1 Pallet", "bid_to_msrp_pct": 1.0,
+             "bids": 0, "location": "Salem, OR, US", "country": "US"},
+            {"auction_id": 2, "lot_size": "1 Pallet", "bid_to_msrp_pct": 1.0,
+             "bids": 0, "location": "Caledonia, MI, US", "country": "US"},
+            {"auction_id": 3, "lot_size": "Full Truckload", "bid_to_msrp_pct": 1.0,
+             "bids": 0, "location": "Caledonia, MI, US", "country": "US"},
+        ]
+
+    def test_nearby_small_lot_wins(self):
+        ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
+        self.assertEqual(ranked[0]["auction_id"], 2)
+
+    def test_distance_outweighs_size_at_default_weights(self):
+        ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
+        order = [row["auction_id"] for row in ranked]
+        self.assertLess(order.index(3), order.index(1))
+
+    def test_ranks_are_contiguous_and_sorted(self):
+        ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
+        self.assertEqual([row["rank"] for row in ranked], [1, 2, 3])
+        scores = [row["score"] for row in ranked]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_unscoreable_lots_sort_last(self):
+        rows = self.rows + [{"auction_id": 9, "lot_size": None,
+                             "bid_to_msrp_pct": None, "bids": None,
+                             "location": None, "country": None}]
+        ranked = ranking.rank_rows(rows, home=self.CHICAGO, prefer_size="any")
+        self.assertEqual(ranked[-1]["auction_id"], 9)
+        self.assertIsNone(ranked[-1]["score"])
+
+    def test_rank_fields_match_the_declared_schema(self):
+        ranked = ranking.rank_rows(self.rows, home=self.CHICAGO)
+        for field in ranking.RANK_FIELDS:
+            self.assertIn(field, ranked[0])
+
+    def test_empty_input(self):
+        self.assertEqual(ranking.rank_rows([], home=self.CHICAGO), [])
+
+
+class WeightParsingTests(unittest.TestCase):
+    def test_defaults_are_returned_untouched(self):
+        self.assertEqual(ranking.parse_weights([]), ranking.DEFAULT_WEIGHTS)
+
+    def test_override_single_weight(self):
+        self.assertEqual(ranking.parse_weights(["proximity=0.9"])["proximity"], 0.9)
+
+    def test_rejects_bad_input(self):
+        for bad in (["proximity"], ["speed=1"], ["proximity=soon"], ["proximity=-1"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ranking.parse_weights(bad)
+
+    def test_rejects_all_zero_weights(self):
+        with self.assertRaises(ValueError):
+            ranking.parse_weights([
+                "proximity=0", "value=0", "size=0", "competition=0"])
+
+    def test_resolve_home_rejects_nonsense(self):
+        with self.assertRaises(ValueError):
+            ranking.resolve_home("Atlantis")
+        self.assertEqual(ranking.resolve_home("Chicago, IL")[1], "metro")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from . import __version__, export, http, marketplaces, scraper
+from . import __version__, export, http, marketplaces, ranking, scraper
 from .models import FIELDS
 
 EPILOG = """\
@@ -19,6 +19,12 @@ examples:
 
   # both marketplaces, full enrichment, newline-delimited JSON
   bstock --marketplace us,eu --max-items 100 --format jsonl --out lots.jsonl
+
+  # rank US lots for a Chicago buyer who wants small pallets
+  bstock -m us --rank --home "Chicago, IL" --format table
+
+  # same, but weight freight distance above everything else
+  bstock -m us --rank --home "Chicago, IL" --weight proximity=0.6 --weight value=0.2
 """
 
 
@@ -109,6 +115,55 @@ def build_parser():
         help="cap images recorded per lot (default: 10)",
     )
 
+    group = parser.add_argument_group("ranking")
+    group.add_argument(
+        "--rank", action="store_true",
+        help="score and sort lots best-first; adds the score columns",
+    )
+    group.add_argument(
+        "--home", default=None, metavar="PLACE",
+        help=(
+            'where the lot has to ship to, e.g. "Chicago, IL", "IL", "GB" or '
+            '"41.88,-87.63". Without it the proximity axis is skipped.'
+        ),
+    )
+    group.add_argument(
+        "--prefer-size", choices=("small", "large", "any"), default="small",
+        help="lot-size preference (default: small)",
+    )
+    group.add_argument(
+        "--weight", action="append", default=[], metavar="NAME=VALUE",
+        help=(
+            "override a scoring weight, repeatable. Defaults: "
+            + ", ".join("{}={}".format(name, value)
+                        for name, value in sorted(ranking.DEFAULT_WEIGHTS.items()))
+        ),
+    )
+    group.add_argument(
+        "--max-distance", type=float, default=ranking.DEFAULT_CAPS["max_distance_km"],
+        metavar="KM",
+        help="distance at which the proximity score reaches zero (default: %(default)s)",
+    )
+    group.add_argument(
+        "--msrp-cap", type=float, default=ranking.DEFAULT_CAPS["msrp_pct"],
+        metavar="PCT",
+        help="bid-to-MSRP %% at which the value score reaches zero (default: %(default)s)",
+    )
+    group.add_argument(
+        "--size-cap", type=float, default=ranking.DEFAULT_CAPS["size_units"],
+        metavar="PALLETS",
+        help="pallet-equivalents at which the size score reaches zero (default: %(default)s)",
+    )
+    group.add_argument(
+        "--bids-cap", type=float, default=ranking.DEFAULT_CAPS["bids"],
+        metavar="N",
+        help="bid count at which the competition score reaches zero (default: %(default)s)",
+    )
+    group.add_argument(
+        "--top", type=int, default=None, metavar="N",
+        help="keep only the best N lots after ranking",
+    )
+
     group = parser.add_argument_group("output")
     group.add_argument(
         "-f", "--format", choices=export.FORMATS, default="csv",
@@ -194,10 +249,34 @@ def main(argv=None):
     selected = resolve_marketplaces(args.marketplace, parser)
     filters = parse_filters(args.filter, parser)
 
-    fields = FIELDS
+    if args.top is not None and not args.rank:
+        parser.error("--top only applies with --rank")
+
+    weights = ranking.parse_weights(args.weight, parser.error)
+    caps = {
+        "max_distance_km": args.max_distance,
+        "msrp_pct": args.msrp_cap,
+        "size_units": args.size_cap,
+        "bids": args.bids_cap,
+    }
+
+    home = None
+    if args.home:
+        try:
+            home, home_precision = ranking.resolve_home(args.home)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.rank:
+        sys.stderr.write(
+            "note: --rank without --home skips the proximity axis; "
+            'pass e.g. --home "Chicago, IL"\n'
+        )
+
+    available = FIELDS + (ranking.RANK_FIELDS if args.rank else ())
+    fields = available
     if args.fields:
         fields = tuple(f.strip() for f in args.fields.split(",") if f.strip())
-        unknown = [f for f in fields if f not in FIELDS]
+        unknown = [f for f in fields if f not in available]
         if unknown:
             parser.error("unknown field(s): {}".format(", ".join(unknown)))
 
@@ -246,6 +325,23 @@ def main(argv=None):
     except http.ScrapeError as exc:
         sys.stderr.write("\nerror: {}\n".format(exc))
         return 1
+
+    if args.rank:
+        rows = ranking.rank_rows(
+            rows, home=home, prefer_size=args.prefer_size,
+            weights=weights, caps=caps,
+        )
+        if home is not None:
+            unplaced = sum(1 for row in rows if row.get("distance_km") is None)
+            if unplaced:
+                progress.warn(
+                    "{} lot(s) could not be placed on a map; ranked without "
+                    "the proximity axis".format(unplaced)
+                )
+        if args.top:
+            rows = rows[: args.top]
+        if args.format == "table" and not args.fields:
+            fields = export.RANK_TABLE_FIELDS
 
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="") as handle:
