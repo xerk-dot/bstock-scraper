@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bstock-scraper"
+version = "0.1.0"
+description = "Scrape public B-Stock Amazon liquidation auction listings. Zero dependencies, read-only."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "xerk-dot" }]
+keywords = ["bstock", "liquidation", "auctions", "amazon", "scraper", "reselling"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+  "Topic :: Office/Business",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/xerk-dot/bstock-scraper"
+Issues = "https://github.com/xerk-dot/bstock-scraper/issues"
+
+[project.scripts]
+bstock = "bstock.cli:main"
+
+[tool.setuptools]
+packages = ["bstock"]
